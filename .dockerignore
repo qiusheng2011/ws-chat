@@ -1,0 +1,19 @@
+# 构建上下文瘦身: 这些不进镜像
+.git/
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+chatroom.db*
+*.log
+Dockerfile
+docker-compose.yml
+.dockerignore
+legacy_broken/
+test_chatroom.py
+repro_drop.py
+README.md
+AGENTS.md

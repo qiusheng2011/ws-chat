@@ -1,15 +1,27 @@
-"""chatroom.common — 协议常量与消息数据类（服务端/客户端共享）。"""
+"""chatroom.common — 协议常量与消息数据类（服务端/客户端共享）。
+
+协议 v2 相比 v1 的变化:
+  • Message 新增 room / cid 两个字段(JSON 里多两个 key, 旧客户端读到会忽略)。
+  • HELLO 携带目标房间与客户端唯一标识; WELCOME 回显最终昵称/房间/人数。
+  • 房间列表由服务端 HTTP 接口 GET /api/rooms 提供, 不占用 WebSocket 帧类型。
+"""
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 
 # 消息类型
-HELLO = "HELLO"           # 客户端连上后自报昵称
-WELCOME = "WELCOME"       # 服务端回给本连接的确认(content 形如 "Alice|2")
-SYSTEM = "SYSTEM"         # 系统公告(加入/离开)
+HELLO = "HELLO"           # 客户端连上后自报昵称/房间/客户端标识
+WELCOME = "WELCOME"       # 服务端回给本连接的确认(content 是房间在线人数)
+SYSTEM = "SYSTEM"         # 系统公告(加入/离开/错误提示)
 CHAT = "CHAT"             # 用户发言
 HEARTBEAT = "HEARTBEAT"   # 心跳帧: ack=False 是 Ping, ack=True 是 Pong
+
+# 房间
+DEFAULT_ROOM = "大厅"                       # 未指定房间时的归属
+ROOM_NAME_MAX = 32                          # 房间名最大字符数
+SEED_ROOMS = ("大厅", "闲聊", "技术")        # 首次启动时预置的房间
+HISTORY_LIMIT = 50                          # 进入房间时重放的历史条数
 
 # 心跳与超时参数(秒)，均可用命令行覆盖，便于测试
 HEARTBEAT_INTERVAL = 10.0   # 服务端每 10 秒发一次 Ping
@@ -17,20 +29,29 @@ PING_TIMEOUT = 3.0          # Ping 后 3 秒内未收到任何帧则判离线
 CONNECT_BASE_DELAY = 1.0    # 重连退避起始(秒)
 CONNECT_MAX_DELAY = 32.0    # 重连退避封顶(秒)
 
-PROTOCOL_VERSION = "chatroom/1.0"
+PROTOCOL_VERSION = "chatroom/2.0"
 
 
 @dataclass
 class Message:
-    """一条协议消息: {"type": "CHAT", "frm": "Alice", "content": "hi", "ack": false}。"""
+    """一条协议消息。
+
+    例: {"type": "CHAT", "frm": "Alice", "content": "hi", "ack": false,
+         "room": "大厅", "cid": "9f2c..."}
+    """
     type: str = CHAT
     frm: str = ""      # CHAT: 用户名; SYSTEM/HELLO: 来源; HEARTBEAT: 空
     content: str = ""
     ack: bool = False  # 仅 HEARTBEAT 使用: False=Ping, True=Pong
+    room: str = ""     # v2: 帧所属房间("" 表示未指定/无关)
+    cid: str = ""      # v2: 客户端唯一标识("" 表示未提供)
 
     def to_json(self) -> str:
         return json.dumps(
-            {"type": self.type, "frm": self.frm, "content": self.content, "ack": self.ack},
+            {
+                "type": self.type, "frm": self.frm, "content": self.content,
+                "ack": self.ack, "room": self.room, "cid": self.cid,
+            },
             ensure_ascii=False,
         )
 
@@ -44,6 +65,8 @@ class Message:
             frm=str(d.get("frm", "")),
             content=str(d.get("content", "")),
             ack=bool(d.get("ack", False)),
+            room=str(d.get("room", "")),
+            cid=str(d.get("cid", "")),
         )
 
     @property
@@ -55,21 +78,32 @@ class Message:
         return self.type == HEARTBEAT and self.ack
 
 
-def make_hello(name: str) -> Message:
-    return Message(type=HELLO, frm=name)
+def normalize_room(name: str) -> str:
+    """清洗房间名: 空白/缺省 → DEFAULT_ROOM; 非法 → ValueError。"""
+    room = (name or "").strip()
+    if not room:
+        return DEFAULT_ROOM
+    if len(room) > ROOM_NAME_MAX or any(c in room for c in "\r\n\t\0"):
+        raise ValueError(f"房间名非法: {name!r}")
+    return room
 
 
-def make_welcome(name: str, online: int) -> Message:
-    """frm 携带服务端最终分配的昵称, content 是当前在线人数。"""
-    return Message(type=WELCOME, frm=name, content=str(online))
+def make_hello(name: str, room: str = DEFAULT_ROOM, cid: str = "") -> Message:
+    """握手: frm=昵称, room=目标房间, cid=客户端唯一标识(空则由服务端生成)。"""
+    return Message(type=HELLO, frm=name, room=room, cid=cid)
 
 
-def make_system(content: str, frm: str = "SYSTEM") -> Message:
-    return Message(type=SYSTEM, frm=frm, content=content)
+def make_welcome(name: str, online: int, room: str = "", cid: str = "") -> Message:
+    """frm 携带服务端最终分配的昵称, content 是本房间在线人数。"""
+    return Message(type=WELCOME, frm=name, content=str(online), room=room, cid=cid)
 
 
-def make_chat(name: str, content: str) -> Message:
-    return Message(type=CHAT, frm=name, content=content)
+def make_system(content: str, frm: str = "SYSTEM", room: str = "") -> Message:
+    return Message(type=SYSTEM, frm=frm, content=content, room=room)
+
+
+def make_chat(name: str, content: str, room: str = "") -> Message:
+    return Message(type=CHAT, frm=name, content=content, room=room)
 
 
 def make_heartbeat(ack: bool = False) -> Message:

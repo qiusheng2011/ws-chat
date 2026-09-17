@@ -1,0 +1,27 @@
+# chatroom 容器编排。
+#
+# 数据持久化: SQLite 库固定写在命名卷 chatroom-data 里,
+# 与镜像/容器生命周期解耦 —— 重新 build、down/up、换机器迁移都不会丢数据。
+#
+#   docker compose up -d --build     # 构建并启动
+#   docker compose logs -f           # 看日志
+#   docker compose down              # 停容器(数据保留在卷里)
+#   docker compose up -d --build     # 改代码后重建, 历史消息/房间/记录都在
+
+services:
+  chatroom:
+    build: .
+    image: chatroom:latest
+    container_name: chatroom
+    ports:
+      # 左边是宿主机端口(随便定), 右边是容器内端口(对应 --port 9002)
+      - "9102:9002"
+    volumes:
+      - chatroom-data:/data
+    restart: unless-stopped
+    environment:
+      # 可选覆盖; 默认值与镜像 CMD 一致
+      TZ: Asia/Shanghai
+
+volumes:
+  chatroom-data:

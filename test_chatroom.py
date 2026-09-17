@@ -3,19 +3,22 @@
 
 运行:  pytest -q test_chatroom.py
 覆盖:  消息编解码 / 退避 / WELCOME 握手 / 加入公告 / CHAT 广播 /
-       心跳 Ping→Pong 保活 / 心跳超时踢人 / 服务端广播离开公告。
+       心跳 Ping→Pong 保活 / 心跳超时踢人 / 服务端广播离开公告 /
+       多房间隔离 / 同 cid 顶号 / 历史回放 / HTTP 房间列表 / 静态资源。
 """
 from __future__ import annotations
 
 import asyncio
+import http.client
+import json
 
 import pytest
 import websockets.asyncio.client as wscli
 import websockets.exceptions as we
 
 from chatroom.common import (
-    CHAT, HEARTBEAT, HELLO, PING_TIMEOUT, SYSTEM, WELCOME,
-    Backoff, Message, make_chat, make_hello, make_heartbeat, make_system,
+    CHAT, DEFAULT_ROOM, HEARTBEAT, HELLO, PING_TIMEOUT, SEED_ROOMS, SYSTEM,
+    WELCOME, Backoff, Message, make_chat, make_hello, make_heartbeat, make_system,
 )
 from chatroom.server import run as server_run
 
@@ -94,13 +97,35 @@ def run(coro):
     return asyncio.run(coro)
 
 
-async def connect_client(uri: str, name: str):
+async def connect_client(uri: str, name: str, room: str = DEFAULT_ROOM, cid: str = ""):
     """连接并发 HELLO, 返回 (ws, WELCOME)。"""
     ws = await wscli.connect(uri)
-    await ws.send(make_hello(name).to_json())
+    await ws.send(make_hello(name, room, cid).to_json())
     welcome = await recv_msg(ws)
     assert welcome.type == WELCOME, f"第一条应为 WELCOME, 实际 {welcome}"
     return ws, welcome
+
+
+async def http_get(port: int, path: str):
+    """在子线程里发 HTTP GET(同端口既有 WS 也有 HTTP, 不能在事件循环里阻塞)。"""
+    def _get():
+        conn = http.client.HTTPConnection(HOST, port, timeout=5)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            return resp.status, resp.getheader("Content-Type") or "", resp.read()
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_get)
+
+
+async def recv_rooms(port: int) -> dict:
+    """GET /api/rooms → {房间名: 在线人数}。"""
+    status, ctype, body = await http_get(port, "/api/rooms")
+    assert status == 200, (status, body[:200])
+    assert "application/json" in ctype
+    return {item["name"]: item["online"] for item in json.loads(body)}
 
 
 async def recv_msg(ws, timeout=2.0) -> Message:
@@ -305,6 +330,227 @@ def test_bare_text_is_treated_as_chat(server):
             assert (got.type, got.frm, got.content) == (CHAT, "Alice", "裸文本也算发言")
             await ws_a.close()
             await ws_b.close()
+        finally:
+            await s.aclose()
+
+    run(case())
+
+
+# ---------------------------------------------------------------- 多房间 / 存储 / HTTP
+
+def test_two_rooms_isolated_chat_and_online(server):
+    async def case():
+        s = await server()
+        try:
+            ws_a, w_a = await connect_client(s.uri, "Alice", room="技术", cid="cid-a")
+            ws_b, w_b = await connect_client(s.uri, "Bob", room="闲聊", cid="cid-b")
+            assert (w_a.room, w_b.room) == ("技术", "闲聊")
+            assert w_a.content == "1" and w_b.content == "1"
+
+            ws_c, w_c = await connect_client(s.uri, "Carol", room="技术", cid="cid-c")
+            assert w_c.content == "2", "WELCOME.content 应是本房间在线人数"
+            assert (await recv_msg(ws_a)).content == "Carol 加入了聊天室"
+
+            ws_d, w_d = await connect_client(s.uri, "Dave", room="闲聊", cid="cid-d")
+            assert w_d.content == "2"
+            assert (await recv_msg(ws_b)).content == "Dave 加入了聊天室"
+
+            # 同房间投递
+            await ws_b.send(make_chat("Bob", "闲聊专用").to_json())
+            got = await recv_msg(ws_d)
+            assert (got.type, got.frm, got.content, got.room) == (CHAT, "Bob", "闲聊专用", "闲聊")
+
+            # 不跨房间: 用 Ping 探测, 下一帧必须是 Pong 而不是隔壁房间的消息
+            for ws in (ws_a, ws_c):
+                await ws.send(make_heartbeat(False).to_json())
+                probe = await recv_msg(ws)
+                assert probe.is_pong, f"跨房间消息泄漏: {probe}"
+
+            await ws_a.send(make_chat("Alice", "技术专用").to_json())
+            assert (await recv_msg(ws_c)).content == "技术专用"
+            for ws in (ws_b, ws_d):
+                await ws.send(make_heartbeat(False).to_json())
+                assert (await recv_msg(ws)).is_pong
+
+            assert s.chatroom.room_online("技术") == 2
+            assert s.chatroom.room_online("闲聊") == 2
+            for ws in (ws_a, ws_b, ws_c, ws_d):
+                await ws.close()
+        finally:
+            await s.aclose()
+
+    run(case())
+
+
+def test_unknown_room_is_autocreated_and_listed(server):
+    async def case():
+        s = await server()
+        try:
+            rooms = await recv_rooms(s.port)
+            assert set(SEED_ROOMS) <= set(rooms), f"应预置种子房间, 实际 {rooms}"
+
+            ws, welcome = await connect_client(s.uri, "Alice", room="新房间", cid="cid-new")
+            assert welcome.room == "新房间"
+            rooms = await recv_rooms(s.port)
+            assert rooms.get("新房间") == 1, f"新房间应自动创建并可见: {rooms}"
+            await ws.close()
+        finally:
+            await s.aclose()
+
+    run(case())
+
+
+def test_rooms_api_reports_online_counts(server):
+    async def case():
+        s = await server()
+        try:
+            ws_a, _ = await connect_client(s.uri, "Alice", room="大厅", cid="cid-a")
+            ws_b, _ = await connect_client(s.uri, "Bob", room="技术", cid="cid-b")
+            rooms = await recv_rooms(s.port)
+            assert rooms["大厅"] == 1 and rooms["技术"] == 1
+            await ws_a.close()
+            await asyncio.sleep(0.1)
+            rooms = await recv_rooms(s.port)
+            assert rooms["大厅"] == 0 and rooms["技术"] == 1
+            await ws_b.close()
+        finally:
+            await s.aclose()
+
+    run(case())
+
+
+def test_history_replayed_on_join(server):
+    async def case():
+        s = await server()
+        try:
+            ws_a, _ = await connect_client(s.uri, "Alice", room="历史房", cid="cid-a")
+            for text in ("历史一", "历史二", "历史三"):
+                await ws_a.send(make_chat("Alice", text).to_json())
+            await asyncio.sleep(0.2)
+            await ws_a.close()
+            await asyncio.sleep(0.1)
+
+            ws_b, _ = await connect_client(s.uri, "Bob", room="历史房", cid="cid-b")
+            history = [await recv_msg(ws_b) for _ in range(3)]
+            assert [m.content for m in history] == ["历史一", "历史二", "历史三"], "历史应按时间正序回放"
+            assert all(m.type == CHAT and m.frm == "Alice" for m in history)
+            await ws_b.close()
+        finally:
+            await s.aclose()
+
+    run(case())
+
+
+def test_same_cid_reconnect_replaces_old_connection(server):
+    async def case():
+        s = await server()
+        try:
+            first, w_first = await connect_client(s.uri, "Alice", room="顶号房", cid="same-cid")
+            assert w_first.frm == "Alice"
+
+            second, w_second = await connect_client(s.uri, "Alice", room="顶号房", cid="same-cid")
+            assert w_second.frm == "Alice", "同 cid 重连应沿用原名, 而不是 Alice#2"
+
+            # 旧连接应被服务端 4001 顶掉(非 1000/1001, websockets 会抛 ConnectionClosedError)
+            with pytest.raises(we.ConnectionClosedError):
+                async for _ in first:
+                    pass
+            assert first.close_code == 4001
+
+            await asyncio.sleep(0.1)
+            assert s.chatroom.room_online("顶号房") == 1, "刷新不应留下重影用户"
+            assert s.chatroom.names().count("Alice") == 1
+            await second.close()
+        finally:
+            await s.aclose()
+
+    run(case())
+
+
+def test_same_cid_can_join_two_rooms_at_once(server):
+    async def case():
+        s = await server()
+        try:
+            a1, _ = await connect_client(s.uri, "Alice", room="甲房", cid="shared-cid")
+            a2, _ = await connect_client(s.uri, "Alice", room="乙房", cid="shared-cid")
+            assert s.chatroom.room_online("甲房") == 1
+            assert s.chatroom.room_online("乙房") == 1
+            await a1.close()
+            await asyncio.sleep(0.1)
+            assert s.chatroom.room_online("乙房") == 1, "顶号作用域只限同一房间"
+            await a2.close()
+        finally:
+            await s.aclose()
+
+    run(case())
+
+
+def test_bad_room_name_is_rejected(server):
+    async def case():
+        s = await server()
+        try:
+            ws = await wscli.connect(s.uri)
+            await ws.send(make_hello("Alice", "x" * 40).to_json())
+            resp = await recv_msg(ws)
+            assert resp.type == SYSTEM and "房间" in resp.content
+            with pytest.raises(we.ConnectionClosed):
+                async for _ in ws:              # 服务端随后 1002 关闭
+                    pass
+        finally:
+            await s.aclose()
+
+    run(case())
+
+
+def test_storage_persists_sessions_and_messages(server):
+    async def case():
+        s = await server()
+        try:
+            ws, _ = await connect_client(s.uri, "Alice", room="存储房", cid="cid-store")
+            await ws.send(make_chat("Alice", "记账").to_json())
+            await asyncio.sleep(0.2)
+            await ws.close()
+            await asyncio.sleep(0.2)
+
+            storage = s.chatroom.storage
+            messages = await storage.recent_messages("存储房")
+            assert [m["content"] for m in messages] == ["记账"]
+            assert messages[0]["nickname"] == "Alice"
+
+            def _sessions():
+                with storage._lock:
+                    return storage._conn.execute(
+                        "SELECT cid, room, nickname, disconnected_at FROM sessions ORDER BY id"
+                    ).fetchall()
+
+            rows = await asyncio.to_thread(_sessions)
+            assert len(rows) == 1, f"应有 1 条连接记录, 实际 {len(rows)}"
+            assert (rows[0]["cid"], rows[0]["room"], rows[0]["nickname"]) == ("cid-store", "存储房", "Alice")
+            assert rows[0]["disconnected_at"], "断开时间应被回填"
+        finally:
+            await s.aclose()
+
+    run(case())
+
+
+def test_static_files_served_and_traversal_rejected(server):
+    async def case():
+        s = await server()
+        try:
+            status, ctype, body = await http_get(s.port, "/")
+            assert status == 200 and "text/html" in ctype
+            assert b"<title>" in body and b"/app.js" in body
+
+            status, ctype, body = await http_get(s.port, "/app.js")
+            assert status == 200 and "javascript" in ctype
+            assert b"WebSocket" in body, "前端应通过 WebSocket 连服务端"
+
+            status, ctype, _ = await http_get(s.port, "/style.css")
+            assert status == 200 and "text/css" in ctype
+
+            for bad in ("/../repro_drop.py", "/../chatroom/server.py", "/nope.txt"):
+                status, _, _ = await http_get(s.port, bad)
+                assert status == 404, f"{bad} 不应被提供 (got {status})"
         finally:
             await s.aclose()
 

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>chatroom · 多房间聊天室</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">💬 chatroom</div>
+    <div class="me">
+      <label class="label" for="nick">昵称</label>
+      <input id="nick" class="nick" maxlength="24" autocomplete="off">
+      <button id="save-nick" class="ghost" type="button">保存</button>
+      <span id="cid" class="cid" title=""></span>
+    </div>
+  </header>
+
+  <main>
+    <!-- 房间列表 -->
+    <section id="view-rooms" class="view">
+      <div class="section-head">
+        <h2>聊天室</h2>
+        <span id="rooms-status" class="muted">加载中…</span>
+      </div>
+      <div id="rooms" class="rooms"></div>
+    </section>
+
+    <!-- 聊天 -->
+    <section id="view-chat" class="view hidden">
+      <div class="section-head">
+        <button id="back" class="ghost" type="button">← 返回</button>
+        <h2 id="chat-title">房间</h2>
+        <span id="chat-status" class="muted">连接中…</span>
+      </div>
+      <div id="banner" class="banner hidden"></div>
+      <div id="messages" class="messages"></div>
+      <form id="composer" class="composer" autocomplete="off">
+        <input id="input" placeholder="说点什么…（回车发送）" maxlength="2000">
+        <button id="send" type="submit">发送</button>
+      </form>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

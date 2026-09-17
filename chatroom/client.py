@@ -2,10 +2,10 @@
 """chatroom.client — WebSocket 聊天室客户端: 自动重连 + 心跳响应 + 终端输入。
 
 运行:
-    python3 -m chatroom client --server ws://127.0.0.1:9002 --name Alice
+    python3 -m chatroom client --server ws://127.0.0.1:9002 --name Alice [--room 大厅]
 
 行为:
-  • 连上后发 HELLO, 收到 WELCOME 后开始工作。
+  • 连上后发 HELLO(昵称 + 房间 + 本次进程的客户端标识 cid), 收到 WELCOME 后开始工作。
   • 收到服务端 Ping(HEARTBEAT ack=False) 立刻回 Pong。
   • 终端每行输入作为一条 CHAT 发出; /quit 退出; 断线期间输入的行重连后自动补发。
   • 断线后指数退避重连: 1s, 2s, 4s, ... 直到 32s 封顶; 成功后退避重置。
@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -23,8 +24,8 @@ import websockets.asyncio.client as wscli
 import websockets.exceptions as we
 
 from .common import (
-    CHAT, CONNECT_BASE_DELAY, CONNECT_MAX_DELAY, HEARTBEAT, SYSTEM, WELCOME,
-    Backoff, Message, make_chat, make_hello, make_heartbeat,
+    CHAT, CONNECT_BASE_DELAY, CONNECT_MAX_DELAY, DEFAULT_ROOM, HEARTBEAT, SYSTEM,
+    WELCOME, Backoff, Message, make_chat, make_hello, make_heartbeat,
 )
 
 logger = logging.getLogger("chatroom.client")
@@ -37,7 +38,8 @@ def render(msg: Message) -> str:
     if msg.type == SYSTEM:
         return f"* {msg.content}"
     if msg.type == WELCOME:
-        return f"* 已加入, 你的名字是 {msg.frm} (当前 {msg.content} 人在线)"
+        room = msg.room or DEFAULT_ROOM
+        return f"* 已加入 {room}, 你的名字是 {msg.frm} (当前 {msg.content} 人在线)"
     if msg.type == HEARTBEAT:
         return ""
     return f"? {msg.type}: {msg.content}"
@@ -98,12 +100,12 @@ async def _sender(ws, feed: StdinFeed, stop: asyncio.Event) -> None:
         print(f"[我] {line}", flush=True)   # 本地回显(服务端不推给发送者)
 
 
-async def session(uri: str, name: str, stop: asyncio.Event,
+async def session(uri: str, name: str, room: str, cid: str, stop: asyncio.Event,
                   feed: StdinFeed) -> Optional[str]:
     """一次连接生命周期: HELLO → 收发 → 返回服务端分配的名字。断开时正常返回。"""
     mine: Optional[str] = None
     async with wscli.connect(uri) as ws:
-        await ws.send(make_hello(name).to_json())
+        await ws.send(make_hello(name, room, cid).to_json())
         sender = asyncio.create_task(_sender(ws, feed, stop))
         try:
             async for raw in ws:
@@ -136,17 +138,23 @@ async def session(uri: str, name: str, stop: asyncio.Event,
     return mine
 
 
-async def run(uri: str, name: str, base: float = CONNECT_BASE_DELAY,
+async def run(uri: str, name: str, room: str = DEFAULT_ROOM,
+              base: float = CONNECT_BASE_DELAY,
               cap: float = CONNECT_MAX_DELAY) -> None:
-    """带指数退避的重连循环，直到 /quit / EOF / Ctrl-C。"""
+    """带指数退避的重连循环，直到 /quit / EOF / Ctrl-C。
+
+    cid 每个进程生成一次: 重连时服务端会认作同一客户端, 刷新/重连不产生重影。
+    """
     stop = asyncio.Event()
     feed = StdinFeed()
     feed.start()
     backoff = Backoff(base, cap)
+    cid = uuid.uuid4().hex
+    print(f"* 目标 {uri} 房间 {room} (cid {cid[:8]}...)", flush=True)
     try:
         while not stop.is_set():
             try:
-                await session(uri, name, stop, feed)
+                await session(uri, name, room, cid, stop, feed)
                 backoff.reset()
                 if stop.is_set():
                     break
@@ -168,6 +176,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="chatroom client")
     ap.add_argument("--server", default="ws://127.0.0.1:9002")
     ap.add_argument("--name", default="anon")
+    ap.add_argument("--room", default=DEFAULT_ROOM, help="要进入的房间(默认 大厅)")
     ap.add_argument("--backoff-base", type=float, default=CONNECT_BASE_DELAY)
     ap.add_argument("--backoff-cap", type=float, default=CONNECT_MAX_DELAY)
     return ap.parse_args(argv)
@@ -177,6 +186,6 @@ async def main(argv=None) -> None:
     args = parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
     try:
-        await run(args.server, args.name, args.backoff_base, args.backoff_cap)
+        await run(args.server, args.name, args.room, args.backoff_base, args.backoff_cap)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("* 退出")
